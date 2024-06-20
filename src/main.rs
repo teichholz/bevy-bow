@@ -2,7 +2,7 @@ use bevy::{
     app::{App, FixedUpdate, Startup, Update},
     asset::{AssetServer, Assets},
     input::ButtonInput,
-    math::{Quat, Vec2, Vec2Swizzles, Vec3, Vec3Swizzles},
+    math::{FloatExt, Quat, Vec2, Vec2Swizzles, Vec3, Vec3Swizzles},
     prelude::{
         default, Camera2dBundle, Changed, Circle, Commands, Component, Deref, DerefMut, Event,
         EventReader, EventWriter, IntoSystemConfigs, MouseButton, Query, Res, ResMut, Resource,
@@ -21,7 +21,6 @@ use bevy::{
     DefaultPlugins,
 };
 
-const BOW_STARTING_POSITION: Vec3 = Vec3::new(0.0, -50.0, 1.0);
 const BOW_FULL_PULL_TIME: f32 = 1.5;
 
 const SCOREBOARD_FONT_SIZE: f32 = 20.0;
@@ -38,7 +37,7 @@ fn main() {
         .insert_resource(Scoreboard { score: 0 })
         .insert_resource(G(5.))
         .add_systems(Startup, (setup).chain())
-        .add_systems(Update, (animate_sprite, move_arrows).chain())
+        .add_systems(Update, (animate_sprite, move_arrows, rotate_arrows).chain())
         .add_systems(
             FixedUpdate,
             (
@@ -71,6 +70,9 @@ struct ScoreboardUi;
 #[derive(Component)]
 struct Bow;
 
+#[derive(Component, Deref, DerefMut, Default)]
+struct BowPullTime(f32);
+
 #[derive(Component, Deref, DerefMut)]
 struct Fixed(bool);
 
@@ -88,7 +90,10 @@ struct ArrowShotEvent {
 struct Pos(Vec2);
 
 #[derive(Component, Deref, DerefMut)]
-struct Velocity(Vec2);
+struct Vel(Vec2);
+
+#[derive(Component, Deref, DerefMut)]
+struct Acc(Vec2);
 
 // Animation
 #[derive(Component)]
@@ -101,9 +106,8 @@ struct AnimationIndices {
 struct AnimationTimer(Timer);
 
 fn setup(
+    window: Query<&Window>,
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
     mut texture_atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     asset_server: Res<AssetServer>,
 ) {
@@ -127,6 +131,7 @@ fn setup(
         },
         animation_indices,
         Bow,
+        BowPullTime::default(),
         AnimationTimer(Timer::from_seconds(
             BOW_FULL_PULL_TIME / 8.,
             TimerMode::Once,
@@ -166,6 +171,7 @@ fn animate_sprite(
     mut query: Query<
         (
             &AnimationIndices,
+            &mut BowPullTime,
             &mut AnimationTimer,
             &mut TextureAtlas,
             &Fixed,
@@ -173,9 +179,11 @@ fn animate_sprite(
         With<Bow>,
     >,
 ) {
-    for (indices, mut timer, mut atlas, fixed) in &mut query {
+    for (indices, mut pull_time, mut timer, mut atlas, fixed) in &mut query {
         if **fixed {
             timer.tick(time.delta());
+            **pull_time += time.delta().as_secs_f32();
+            **pull_time = pull_time.clamp(0.0, BOW_FULL_PULL_TIME);
             if timer.just_finished() {
                 if atlas.index < indices.last {
                     atlas.index += 1;
@@ -184,6 +192,7 @@ fn animate_sprite(
             }
         } else {
             atlas.index = indices.first;
+            **pull_time = 0.;
             timer.reset();
         }
     }
@@ -207,19 +216,37 @@ fn update_mouse(
 }
 
 fn shoot_bow(
+    mouse: Res<Mouse>,
+    window: Query<&Window>,
     buttons: Res<ButtonInput<MouseButton>>,
-    bow: Query<(&Transform, &Fixed), With<Bow>>,
+    bow: Query<(&Transform, &Fixed, &BowPullTime), With<Bow>>,
     mut shot_event_writer: EventWriter<ArrowShotEvent>,
 ) {
-    let (tr, fixed) = bow.single();
+    let (tr, fixed, pull_time) = bow.single();
+    let win = window.single();
 
     if **fixed && buttons.just_released(MouseButton::Left) {
+
+        // 1 second to reach the window from the left to the right
+        let max_vel = win.width();
+        let vel = (max_vel / 4.).lerp(max_vel, **pull_time / BOW_FULL_PULL_TIME);
+
+
+        let dir_to_mouse = (tr.translation - mouse.extend(0.)).normalize();
+        let angle = dir_to_mouse.y.atan2(dir_to_mouse.x);
+
+        print!("dir to mouse {:?}", dir_to_mouse);
+        print!("angle is {:?}\n", angle);
+
+        let vx = vel * angle.cos();
+        let vy = vel * angle.sin();
+
+        print!("vx {:?} vy {:?}\n", vx, vy);
+
         shot_event_writer.send(ArrowShotEvent {
             pos: tr.translation.xy(),
             angle: tr.rotation,
-            // 50 px per seconds, velocity should be relative to the time it needs to escape the
-            //    screen
-            velocity: Vec2::new(50.0, 0.0),
+            velocity: Vec2::new(vx, vy),
         });
     }
 }
@@ -255,6 +282,7 @@ fn rotate_bow(mouse: Res<Mouse>, mut bow: Query<(&mut Transform, &Fixed), With<B
 }
 
 fn shoot_arrow(
+    g: Res<G>,
     mut ev_shoot: EventReader<ArrowShotEvent>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -267,14 +295,24 @@ fn shoot_arrow(
                 transform: Transform::from_translation(ev.pos.extend(0.0)).with_rotation(ev.angle),
                 ..default()
             },
-            Velocity(ev.velocity),
+            Vel(ev.velocity),
+            Acc(Vec2::new(0., -**g))
         ));
     }
 }
 
-fn move_arrows(time: Res<Time>, g: Res<G>, mut arrows: Query<(&mut Transform, &Velocity), With<Arrow>>) {
-    for (mut tr, vel) in &mut arrows {
+fn move_arrows(time: Res<Time>, mut arrows: Query<(&mut Transform, &mut Vel, &Acc), With<Arrow>>) {
+    for (mut tr, mut vel, acc) in &mut arrows {
         tr.translation.x += vel.x * time.delta_seconds();
-        tr.translation.y -= **g;
+        tr.translation.y += vel.y * time.delta_seconds();
+        vel.y += acc.y
+    }
+}
+
+fn rotate_arrows(mut arrows: Query<(&mut Transform, &Vel), With<Arrow>>) {
+    for (mut tr, vel) in &mut arrows {
+        let n = vel.normalize();
+        let angle = n.y.atan2(n.x);
+        tr.rotation = Quat::from_rotation_z(angle);
     }
 }
