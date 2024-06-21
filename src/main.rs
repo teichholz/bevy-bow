@@ -2,12 +2,13 @@ use bevy::{
     app::{App, FixedUpdate, Startup, Update},
     asset::{AssetServer, Assets},
     input::ButtonInput,
-    math::{FloatExt, Quat, Vec2, Vec2Swizzles, Vec3, Vec3Swizzles},
+    math::{FloatExt, Quat, Rect, Vec2, Vec2Swizzles, Vec3, Vec3Swizzles},
     prelude::{
-        default, Camera2dBundle, Changed, Circle, Commands, Component, Deref, DerefMut, Event,
-        EventReader, EventWriter, IntoSystemConfigs, MouseButton, Query, Res, ResMut, Resource,
-        With,
+        default, Camera2dBundle, Changed, Circle, Commands, Component, Deref, DerefMut, Entity,
+        Event, EventReader, EventWriter, IntoSystemConfigs, MouseButton, Query, Res, ResMut,
+        Resource, With,
     },
+    reflect::Reflect,
     render::{camera::Camera, color::Color, mesh::Mesh},
     sprite::{
         ColorMaterial, MaterialMesh2dBundle, SpriteBundle, SpriteSheetBundle, TextureAtlas,
@@ -20,6 +21,7 @@ use bevy::{
     window::{PrimaryWindow, Window},
     DefaultPlugins,
 };
+use bevy_inspector_egui::{quick::{ResourceInspectorPlugin, WorldInspectorPlugin}};
 
 const BOW_FULL_PULL_TIME: f32 = 1.5;
 
@@ -29,13 +31,14 @@ const SCOREBOARD_TEXT_PADDING: Val = Val::Px(5.0);
 const TEXT_COLOR: Color = Color::rgb(0.5, 0.5, 1.0);
 const SCORE_COLOR: Color = Color::rgb(1.0, 0.5, 0.5);
 
-
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        .add_plugins(WorldInspectorPlugin::new())
         .insert_resource(Mouse(Vec2::ZERO))
         .insert_resource(Scoreboard { score: 0 })
         .insert_resource(G(5.))
+        .add_plugins(ResourceInspectorPlugin::<G>::new())
         .add_systems(Startup, (setup).chain())
         .add_systems(Update, (animate_sprite, move_arrows, rotate_arrows).chain())
         .add_systems(
@@ -46,14 +49,17 @@ fn main() {
                 shoot_arrow,
                 move_bow_cursor,
                 rotate_bow,
+                check_arrow_bounds
             )
                 .chain(),
         )
+        .add_systems(FixedUpdate, despawn_entities)
         .add_event::<ArrowShotEvent>()
+        .add_event::<DespawnEvent>()
         .run();
 }
 
-#[derive(Resource, Deref, DerefMut)]
+#[derive(Resource, Deref, DerefMut, Reflect)]
 struct G(f32);
 
 #[derive(Resource, Deref, DerefMut)]
@@ -85,6 +91,9 @@ struct ArrowShotEvent {
     angle: Quat,
     velocity: Vec2,
 }
+
+#[derive(Event, Deref, DerefMut)]
+struct DespawnEvent(Entity);
 
 #[derive(Component)]
 struct Pos(Vec2);
@@ -226,11 +235,9 @@ fn shoot_bow(
     let win = window.single();
 
     if **fixed && buttons.just_released(MouseButton::Left) {
-
         // 1 second to reach the window from the left to the right
         let max_vel = win.width();
         let vel = (max_vel / 4.).lerp(max_vel, **pull_time / BOW_FULL_PULL_TIME);
-
 
         let dir_to_mouse = (tr.translation - mouse.extend(0.)).normalize();
         let angle = dir_to_mouse.y.atan2(dir_to_mouse.x);
@@ -296,7 +303,7 @@ fn shoot_arrow(
                 ..default()
             },
             Vel(ev.velocity),
-            Acc(Vec2::new(0., -**g))
+            Acc(Vec2::new(0., -**g)),
         ));
     }
 }
@@ -305,7 +312,25 @@ fn move_arrows(time: Res<Time>, mut arrows: Query<(&mut Transform, &mut Vel, &Ac
     for (mut tr, mut vel, acc) in &mut arrows {
         tr.translation.x += vel.x * time.delta_seconds();
         tr.translation.y += vel.y * time.delta_seconds();
-        vel.y += acc.y
+        **vel += **acc;
+    }
+}
+
+
+fn check_arrow_bounds(arrows: Query<(Entity, &Transform), With<Arrow>>, window: Query<&Window>, mut despawns: EventWriter<DespawnEvent>) {
+    let win = window.single();
+    for (entity, tr) in &arrows {
+        let pos = tr.translation.xy();
+        print!("pos {:?}\n", pos);
+
+        let width = win.width();
+        let height = win.height();
+        let rect = Rect::from_corners(Vec2::new(width / -2., height / 2.), Vec2::new(width / 2., height / -2.));
+        print!("rect {:?}\n", rect);
+
+        if !rect.contains(pos) {
+            despawns.send(DespawnEvent(entity));
+        }
     }
 }
 
@@ -314,5 +339,11 @@ fn rotate_arrows(mut arrows: Query<(&mut Transform, &Vel), With<Arrow>>) {
         let n = vel.normalize();
         let angle = n.y.atan2(n.x);
         tr.rotation = Quat::from_rotation_z(angle);
+    }
+}
+
+fn despawn_entities(mut commands: Commands, mut events: EventReader<DespawnEvent>) {
+    for ev in events.read() {
+        commands.entity(**ev).despawn()
     }
 }
