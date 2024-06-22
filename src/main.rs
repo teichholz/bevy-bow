@@ -6,8 +6,8 @@ use bevy::{
     math::{FloatExt, Quat, Rect, Vec2, Vec2Swizzles, Vec3, Vec3Swizzles},
     prelude::{
         default, Camera2dBundle, Changed, Circle, Commands, Component, Deref, DerefMut, Entity,
-        Event, EventReader, EventWriter, IntoSystemConfigs, MouseButton, Query, Res, ResMut,
-        Resource, With,
+        Event, EventReader, EventWriter, Gizmos, IntoSystemConfigs, MouseButton, Query, Res,
+        ResMut, Resource, With,
     },
     reflect::Reflect,
     render::{camera::Camera, color::Color, mesh::Mesh},
@@ -23,9 +23,11 @@ use bevy::{
     DefaultPlugins,
 };
 use bevy_bow::{ProgressBar, ProgressBarBundle, ProgressBarMaterial, ProgressBarPlugin};
+use bevy_editor_pls::EditorPlugin;
 use bevy_inspector_egui::quick::{ResourceInspectorPlugin, WorldInspectorPlugin};
 
-const BOW_FULL_PULL_TIME: f32 = 1.5;
+const BOW_FULL_PULL_TIME: f32 = 1.;
+const BOW_SIZE: f32 = 190. / 3.;
 
 const SCOREBOARD_FONT_SIZE: f32 = 20.0;
 const SCOREBOARD_TEXT_PADDING: Val = Val::Px(5.0);
@@ -40,10 +42,13 @@ fn main() {
         .add_plugins(WorldInspectorPlugin::new())
         .insert_resource(Mouse(Vec2::ZERO))
         .insert_resource(Scoreboard { score: 0 })
-        .insert_resource(G(5.))
+        .insert_resource(G(18.))
         .add_plugins(ResourceInspectorPlugin::<G>::new())
         .add_systems(Startup, (setup).chain())
-        .add_systems(Update, (draw_bow, move_arrows, rotate_arrows).chain())
+        .add_systems(
+            Update,
+            (draw_bow, draw_bow_area, move_arrows, rotate_arrows).chain(),
+        )
         .add_systems(
             FixedUpdate,
             (
@@ -51,13 +56,15 @@ fn main() {
                 shoot_bow,
                 shoot_arrow,
                 move_bow_cursor,
+                clamp_bow,
                 rotate_bow,
                 check_arrow_bounds,
-                progress_bow
+                progress_bow,
             )
                 .chain(),
         )
         .add_systems(FixedUpdate, despawn_entities)
+        .add_systems(FixedUpdate, on_window_change)
         .add_event::<ArrowShotEvent>()
         .add_event::<DespawnEvent>()
         .run();
@@ -79,6 +86,24 @@ struct ScoreboardUi;
 
 #[derive(Component)]
 struct Bow;
+
+#[derive(Resource, Deref, DerefMut)]
+struct BowArea {
+    tl: Vec2,
+    br: Vec2,
+    #[deref]
+    rect: Rect,
+}
+
+impl BowArea {
+    fn new(tl: Vec2, br: Vec2) -> Self {
+        return BowArea {
+            tl,
+            br,
+            rect: Rect::from_corners(tl, br),
+        };
+    }
+}
 
 #[derive(Component)]
 struct PullProgressBar;
@@ -121,6 +146,9 @@ struct AnimationIndices {
 #[derive(Component, Deref, DerefMut)]
 struct AnimationTimer(Timer);
 
+#[derive(Component)]
+struct MainCamera;
+
 fn setup(
     window: Query<&Window>,
     mut commands: Commands,
@@ -128,12 +156,14 @@ fn setup(
     mut progress_bar_materials: ResMut<Assets<ProgressBarMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
-    commands.spawn(Camera2dBundle::default());
+    commands.spawn((Camera2dBundle::default(), MainCamera));
+
+    let win = window.single();
 
     // Bow
     let texture = asset_server.load("bow/bow-atlas.png");
     let size = 190.;
-    let layout = TextureAtlasLayout::from_grid(Vec2::new(size / 3., size / 3.), 3, 3, None, None);
+    let layout = TextureAtlasLayout::from_grid(Vec2::new(BOW_SIZE, BOW_SIZE), 3, 3, None, None);
     let texture_atlas_layout = texture_atlas_layouts.add(layout);
     // Use only the subset of sprites in the sheet that make up the run animation
     let animation_indices = AnimationIndices { first: 0, last: 7 };
@@ -158,12 +188,16 @@ fn setup(
         ))
         .id();
 
+    commands.insert_resource(BowArea::new(
+        Vec2::new(0., win.height() / 2.),
+        Vec2::new(win.width() / -4., win.height() / -2.),
+    ));
+
     let bar = ProgressBar::new(vec![(200, Color::BLUE)]);
     let style = Style {
         position_type: PositionType::Absolute,
-        width: Val::Px(size / 3.),
+        width: Val::Px(BOW_SIZE),
         height: Val::Px(20.),
-        //top: Val::Px(200.0),
         ..default()
     };
     let pull_bar = commands
@@ -172,6 +206,7 @@ fn setup(
             ProgressBarBundle::new(style, bar, &mut progress_bar_materials),
         ))
         .id();
+    //commands.entity(bow).add_child(pull_bar);
 
     // Scoreboard
     commands.spawn((
@@ -198,6 +233,15 @@ fn setup(
             ..default()
         }),
     ));
+}
+
+fn on_window_change(window: Query<&Window, Changed<Window>>, mut bow_area: ResMut<BowArea>) {
+    for win in &window {
+        *bow_area = BowArea::new(
+            Vec2::new(win.width() / -2., win.height() / 2.),
+            Vec2::new(win.width() / -4., win.height() / -2.),
+        )
+    }
 }
 
 fn draw_bow(
@@ -236,26 +280,38 @@ fn draw_bow(
 
 fn progress_bow(
     time: Res<Time>,
+    window: Query<&Window>,
     bow_query: Query<(&Fixed, &Transform), With<Bow>>,
     mut progress_query: Query<(&mut ProgressBar, &mut Style), With<PullProgressBar>>,
 ) {
+    let win = window.single();
     let (fixed, bow_transform) = bow_query.single();
     let (mut progress, mut style) = progress_query.single_mut();
 
     if **fixed {
-        style.top = Val::Px(bow_transform.translation.y);
-        style.left = Val::Px(bow_transform.translation.x);
-        print!("style.top {:?} style.left {:?}\n", style.top, style.left);
+        // I couldn't get the parent child relationship to work properly for transforms, so
+        // I map the "normal" carthesian system into the ui one
+        style.top =
+            Val::Px((bow_transform.translation.y - win.height() / 2.).abs() + BOW_SIZE / 2.);
+        style.left = Val::Px(bow_transform.translation.x + win.width() / 2. - BOW_SIZE / 2.);
         progress.increase_progress(time.delta_seconds() / BOW_FULL_PULL_TIME);
     } else {
         progress.reset();
     }
 }
 
+fn draw_bow_area(bow_area: Res<BowArea>, mut gizmos: Gizmos) {
+    gizmos.line_2d(
+        Vec2::new(bow_area.br.x, bow_area.tl.y),
+        Vec2::new(bow_area.br.x, bow_area.br.y),
+        Color::DARK_GRAY,
+    );
+}
+
 fn update_mouse(
     mut mouse: ResMut<Mouse>,
     window: Query<&Window, With<PrimaryWindow>>,
-    camera_q: Query<(&Camera, &GlobalTransform)>,
+    camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
 ) {
     let win = window.single();
     let (camera, camera_transform) = camera_q.single();
@@ -313,6 +369,14 @@ fn move_bow_cursor(
         tr.translation.x = mouse.x;
         tr.translation.y = mouse.y;
     }
+}
+
+fn clamp_bow(
+    bow_area: Res<BowArea>,
+    mut bowq: Query<&mut Transform, With<Bow>>,
+) {
+    let mut bow = bowq.single_mut();
+    bow.translation = bow.translation.clamp(Vec3::new(bow_area.tl.x, bow_area.br.y, 0.), Vec3::new(bow_area.br.x, bow_area.tl.y, 1.));
 }
 
 fn rotate_bow(mouse: Res<Mouse>, mut bow: Query<(&mut Transform, &Fixed), With<Bow>>) {

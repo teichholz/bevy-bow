@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 bevy = { version = "0.13.2", features = ["dynamic_linking"] }
 bevy-inspector-egui = { version = "0.24.0" }
+bevy_editor_pls = { version = "0.8" }
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]
