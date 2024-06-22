@@ -1,6 +1,7 @@
 use bevy::{
     app::{App, FixedUpdate, Startup, Update},
     asset::{AssetServer, Assets},
+    hierarchy::BuildChildren,
     input::ButtonInput,
     math::{FloatExt, Quat, Rect, Vec2, Vec2Swizzles, Vec3, Vec3Swizzles},
     prelude::{
@@ -21,7 +22,8 @@ use bevy::{
     window::{PrimaryWindow, Window},
     DefaultPlugins,
 };
-use bevy_inspector_egui::{quick::{ResourceInspectorPlugin, WorldInspectorPlugin}};
+use bevy_bow::{ProgressBar, ProgressBarBundle, ProgressBarMaterial, ProgressBarPlugin};
+use bevy_inspector_egui::quick::{ResourceInspectorPlugin, WorldInspectorPlugin};
 
 const BOW_FULL_PULL_TIME: f32 = 1.5;
 
@@ -34,13 +36,14 @@ const SCORE_COLOR: Color = Color::rgb(1.0, 0.5, 0.5);
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        .add_plugins(ProgressBarPlugin)
         .add_plugins(WorldInspectorPlugin::new())
         .insert_resource(Mouse(Vec2::ZERO))
         .insert_resource(Scoreboard { score: 0 })
         .insert_resource(G(5.))
         .add_plugins(ResourceInspectorPlugin::<G>::new())
         .add_systems(Startup, (setup).chain())
-        .add_systems(Update, (animate_sprite, move_arrows, rotate_arrows).chain())
+        .add_systems(Update, (draw_bow, move_arrows, rotate_arrows).chain())
         .add_systems(
             FixedUpdate,
             (
@@ -49,7 +52,8 @@ fn main() {
                 shoot_arrow,
                 move_bow_cursor,
                 rotate_bow,
-                check_arrow_bounds
+                check_arrow_bounds,
+                progress_bow
             )
                 .chain(),
         )
@@ -75,6 +79,9 @@ struct ScoreboardUi;
 
 #[derive(Component)]
 struct Bow;
+
+#[derive(Component)]
+struct PullProgressBar;
 
 #[derive(Component, Deref, DerefMut, Default)]
 struct BowPullTime(f32);
@@ -118,6 +125,7 @@ fn setup(
     window: Query<&Window>,
     mut commands: Commands,
     mut texture_atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+    mut progress_bar_materials: ResMut<Assets<ProgressBarMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
     commands.spawn(Camera2dBundle::default());
@@ -129,24 +137,41 @@ fn setup(
     let texture_atlas_layout = texture_atlas_layouts.add(layout);
     // Use only the subset of sprites in the sheet that make up the run animation
     let animation_indices = AnimationIndices { first: 0, last: 7 };
-    commands.spawn((
-        SpriteSheetBundle {
-            texture,
-            atlas: TextureAtlas {
-                layout: texture_atlas_layout,
-                index: animation_indices.first,
+    let bow = commands
+        .spawn((
+            SpriteSheetBundle {
+                texture,
+                atlas: TextureAtlas {
+                    layout: texture_atlas_layout,
+                    index: animation_indices.first,
+                },
+                ..default()
             },
-            ..default()
-        },
-        animation_indices,
-        Bow,
-        BowPullTime::default(),
-        AnimationTimer(Timer::from_seconds(
-            BOW_FULL_PULL_TIME / 8.,
-            TimerMode::Once,
-        )),
-        Fixed(false),
-    ));
+            animation_indices,
+            Bow,
+            BowPullTime::default(),
+            AnimationTimer(Timer::from_seconds(
+                BOW_FULL_PULL_TIME / 8.,
+                TimerMode::Once,
+            )),
+            Fixed(false),
+        ))
+        .id();
+
+    let bar = ProgressBar::new(vec![(200, Color::BLUE)]);
+    let style = Style {
+        position_type: PositionType::Absolute,
+        width: Val::Px(size / 3.),
+        height: Val::Px(20.),
+        //top: Val::Px(200.0),
+        ..default()
+    };
+    let pull_bar = commands
+        .spawn((
+            PullProgressBar,
+            ProgressBarBundle::new(style, bar, &mut progress_bar_materials),
+        ))
+        .id();
 
     // Scoreboard
     commands.spawn((
@@ -175,7 +200,7 @@ fn setup(
     ));
 }
 
-fn animate_sprite(
+fn draw_bow(
     time: Res<Time>,
     mut query: Query<
         (
@@ -188,6 +213,8 @@ fn animate_sprite(
         With<Bow>,
     >,
 ) {
+    // I could probably also do something linke With<Fixed> and then insert the BowPullTime
+    // Component later and remove it after the shot
     for (indices, mut pull_time, mut timer, mut atlas, fixed) in &mut query {
         if **fixed {
             timer.tick(time.delta());
@@ -204,6 +231,24 @@ fn animate_sprite(
             **pull_time = 0.;
             timer.reset();
         }
+    }
+}
+
+fn progress_bow(
+    time: Res<Time>,
+    bow_query: Query<(&Fixed, &Transform), With<Bow>>,
+    mut progress_query: Query<(&mut ProgressBar, &mut Style), With<PullProgressBar>>,
+) {
+    let (fixed, bow_transform) = bow_query.single();
+    let (mut progress, mut style) = progress_query.single_mut();
+
+    if **fixed {
+        style.top = Val::Px(bow_transform.translation.y);
+        style.left = Val::Px(bow_transform.translation.x);
+        print!("style.top {:?} style.left {:?}\n", style.top, style.left);
+        progress.increase_progress(time.delta_seconds() / BOW_FULL_PULL_TIME);
+    } else {
+        progress.reset();
     }
 }
 
@@ -241,9 +286,6 @@ fn shoot_bow(
 
         let dir_to_mouse = (tr.translation - mouse.extend(0.)).normalize();
         let angle = dir_to_mouse.y.atan2(dir_to_mouse.x);
-
-        print!("dir to mouse {:?}", dir_to_mouse);
-        print!("angle is {:?}\n", angle);
 
         let vx = vel * angle.cos();
         let vy = vel * angle.sin();
@@ -316,17 +358,21 @@ fn move_arrows(time: Res<Time>, mut arrows: Query<(&mut Transform, &mut Vel, &Ac
     }
 }
 
-
-fn check_arrow_bounds(arrows: Query<(Entity, &Transform), With<Arrow>>, window: Query<&Window>, mut despawns: EventWriter<DespawnEvent>) {
+fn check_arrow_bounds(
+    arrows: Query<(Entity, &Transform), With<Arrow>>,
+    window: Query<&Window>,
+    mut despawns: EventWriter<DespawnEvent>,
+) {
     let win = window.single();
     for (entity, tr) in &arrows {
         let pos = tr.translation.xy();
-        print!("pos {:?}\n", pos);
 
         let width = win.width();
         let height = win.height();
-        let rect = Rect::from_corners(Vec2::new(width / -2., height / 2.), Vec2::new(width / 2., height / -2.));
-        print!("rect {:?}\n", rect);
+        let rect = Rect::from_corners(
+            Vec2::new(width / -2., height / 2.),
+            Vec2::new(width / 2., height / -2.),
+        );
 
         if !rect.contains(pos) {
             despawns.send(DespawnEvent(entity));
