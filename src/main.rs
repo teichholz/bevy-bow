@@ -6,8 +6,8 @@ use bevy::{
     math::{FloatExt, Quat, Rect, Vec2, Vec2Swizzles, Vec3, Vec3Swizzles},
     prelude::{
         default, Camera2dBundle, Changed, Circle, Commands, Component, Deref, DerefMut, Entity,
-        Event, EventReader, EventWriter, Gizmos, IntoSystemConfigs, MouseButton, Query, Res,
-        ResMut, Resource, With,
+        Event, EventReader, EventWriter, Gizmos, IntoSystemConfigs, Line2d, MouseButton, Query,
+        Res, ResMut, Resource, With,
     },
     reflect::Reflect,
     render::{camera::Camera, color::Color, mesh::Mesh},
@@ -25,6 +25,7 @@ use bevy::{
 use bevy_bow::{ProgressBar, ProgressBarBundle, ProgressBarMaterial, ProgressBarPlugin};
 use bevy_editor_pls::EditorPlugin;
 use bevy_inspector_egui::quick::{ResourceInspectorPlugin, WorldInspectorPlugin};
+use rand::prelude::*;
 
 const BOW_FULL_PULL_TIME: f32 = 1.;
 const BOW_SIZE: f32 = 190. / 3.;
@@ -47,7 +48,14 @@ fn main() {
         .add_systems(Startup, (setup).chain())
         .add_systems(
             Update,
-            (draw_bow, draw_bow_area, move_arrows, rotate_arrows).chain(),
+            (
+                draw_bow,
+                draw_bow_area,
+                draw_enemy_area,
+                move_arrows,
+                rotate_arrows,
+            )
+                .chain(),
         )
         .add_systems(
             FixedUpdate,
@@ -88,21 +96,79 @@ struct ScoreboardUi;
 struct Bow;
 
 #[derive(Resource, Deref, DerefMut)]
-struct BowArea {
+struct BowArea(Area);
+
+#[derive(Resource, Deref, DerefMut)]
+struct EnemyArea(Area);
+
+struct Area {
     tl: Vec2,
     br: Vec2,
-    #[deref]
     rect: Rect,
+    markers: [(Vec2, Vec2); 4],
 }
 
-impl BowArea {
+impl Area {
     fn new(tl: Vec2, br: Vec2) -> Self {
-        return BowArea {
+        let markers = [
+            (Vec2::new(tl.x, tl.y), Vec2::new(br.x, tl.y)),
+            (Vec2::new(br.x, tl.y), Vec2::new(br.x, br.y)),
+            (Vec2::new(br.x, br.y), Vec2::new(tl.x, br.y)),
+            (Vec2::new(tl.x, br.y), Vec2::new(tl.x, tl.y)),
+        ];
+
+        return Area {
             tl,
             br,
             rect: Rect::from_corners(tl, br),
+            markers,
         };
     }
+
+    fn shrink(self, factor: f32) -> Self {
+        let tl = self.tl.lerp(self.br, factor);
+        let br = self.br.lerp(self.tl, factor);
+        return Area::new(tl, br);
+    }
+}
+
+#[derive(Component)]
+struct Path {
+    start: Vec2,
+    end: Vec2,
+}
+
+impl Path {
+    fn reverse(mut self) {
+        std::mem::swap(&mut self.start, &mut self.end);
+    }
+}
+
+trait PathFindingStrategy {
+    fn find(self, line1: (Vec2, Vec2), line2: (Vec2, Vec2)) -> Path;
+}
+
+struct MinLengthPathFinder(f32);
+
+impl PathFindingStrategy for MinLengthPathFinder {
+    fn find(self, line1: (Vec2, Vec2), line2: (Vec2, Vec2)) -> Path {
+        let min = self.0;
+        let mut start: Vec2;
+        let mut end: Vec2;
+        loop {
+            start = random_point_on_line(line1.0, line1.1);
+            end = random_point_on_line(line2.0, line2.1);
+            if (end - start).length() >= min {
+                break;
+            }
+        }
+        return Path { start, end };
+    }
+}
+
+fn random_point_on_line(from: Vec2, to: Vec2) -> Vec2 {
+    let t = rand::random::<f32>();
+    return from.lerp(to, t);
 }
 
 #[derive(Component)]
@@ -126,9 +192,6 @@ struct ArrowShotEvent {
 
 #[derive(Event, Deref, DerefMut)]
 struct DespawnEvent(Entity);
-
-#[derive(Component)]
-struct Pos(Vec2);
 
 #[derive(Component, Deref, DerefMut)]
 struct Vel(Vec2);
@@ -162,35 +225,40 @@ fn setup(
 
     // Bow
     let texture = asset_server.load("bow/bow-atlas.png");
-    let size = 190.;
     let layout = TextureAtlasLayout::from_grid(Vec2::new(BOW_SIZE, BOW_SIZE), 3, 3, None, None);
     let texture_atlas_layout = texture_atlas_layouts.add(layout);
     // Use only the subset of sprites in the sheet that make up the run animation
     let animation_indices = AnimationIndices { first: 0, last: 7 };
-    let bow = commands
-        .spawn((
-            SpriteSheetBundle {
-                texture,
-                atlas: TextureAtlas {
-                    layout: texture_atlas_layout,
-                    index: animation_indices.first,
-                },
-                ..default()
+    commands.spawn((
+        SpriteSheetBundle {
+            texture,
+            atlas: TextureAtlas {
+                layout: texture_atlas_layout,
+                index: animation_indices.first,
             },
-            animation_indices,
-            Bow,
-            BowPullTime::default(),
-            AnimationTimer(Timer::from_seconds(
-                BOW_FULL_PULL_TIME / 8.,
-                TimerMode::Once,
-            )),
-            Fixed(false),
-        ))
-        .id();
+            ..default()
+        },
+        animation_indices,
+        Bow,
+        BowPullTime::default(),
+        AnimationTimer(Timer::from_seconds(
+            BOW_FULL_PULL_TIME / 8.,
+            TimerMode::Once,
+        )),
+        Fixed(false),
+    ));
 
-    commands.insert_resource(BowArea::new(
+    commands.insert_resource(BowArea(Area::new(
         Vec2::new(0., win.height() / 2.),
         Vec2::new(win.width() / -4., win.height() / -2.),
+    )));
+
+    commands.insert_resource(EnemyArea(
+        Area::new(
+            Vec2::new(0., win.height() / 2.),
+            Vec2::new(win.width() / 2., win.height() / -2.),
+        )
+        .shrink(0.1),
     ));
 
     let bar = ProgressBar::new(vec![(200, Color::BLUE)]);
@@ -200,13 +268,10 @@ fn setup(
         height: Val::Px(20.),
         ..default()
     };
-    let pull_bar = commands
-        .spawn((
-            PullProgressBar,
-            ProgressBarBundle::new(style, bar, &mut progress_bar_materials),
-        ))
-        .id();
-    //commands.entity(bow).add_child(pull_bar);
+    commands.spawn((
+        PullProgressBar,
+        ProgressBarBundle::new(style, bar, &mut progress_bar_materials),
+    ));
 
     // Scoreboard
     commands.spawn((
@@ -235,11 +300,22 @@ fn setup(
     ));
 }
 
-fn on_window_change(window: Query<&Window, Changed<Window>>, mut bow_area: ResMut<BowArea>) {
+fn on_window_change(
+    window: Query<&Window, Changed<Window>>,
+    mut bow_area: ResMut<BowArea>,
+    mut enemy_area: ResMut<EnemyArea>,
+) {
     for win in &window {
-        *bow_area = BowArea::new(
+        *bow_area = BowArea(Area::new(
             Vec2::new(win.width() / -2., win.height() / 2.),
             Vec2::new(win.width() / -4., win.height() / -2.),
+        ));
+        *enemy_area = EnemyArea(
+            Area::new(
+                Vec2::new(0., win.height() / 2.),
+                Vec2::new(win.width() / 2., win.height() / -2.),
+            )
+            .shrink(0.1),
         )
     }
 }
@@ -257,7 +333,7 @@ fn draw_bow(
         With<Bow>,
     >,
 ) {
-    // I could probably also do something linke With<Fixed> and then insert the BowPullTime
+    // I could probably also do something like With<Fixed> and then insert the BowPullTime
     // Component later and remove it after the shot
     for (indices, mut pull_time, mut timer, mut atlas, fixed) in &mut query {
         if **fixed {
@@ -301,11 +377,15 @@ fn progress_bow(
 }
 
 fn draw_bow_area(bow_area: Res<BowArea>, mut gizmos: Gizmos) {
-    gizmos.line_2d(
-        Vec2::new(bow_area.br.x, bow_area.tl.y),
-        Vec2::new(bow_area.br.x, bow_area.br.y),
-        Color::DARK_GRAY,
-    );
+    for marker in bow_area.markers {
+        gizmos.line_2d(marker.0, marker.1, Color::DARK_GRAY);
+    }
+}
+
+fn draw_enemy_area(enemy_area: Res<EnemyArea>, mut gizmos: Gizmos) {
+    for marker in enemy_area.markers {
+        gizmos.line_2d(marker.0, marker.1, Color::DARK_GRAY);
+    }
 }
 
 fn update_mouse(
@@ -371,12 +451,12 @@ fn move_bow_cursor(
     }
 }
 
-fn clamp_bow(
-    bow_area: Res<BowArea>,
-    mut bowq: Query<&mut Transform, With<Bow>>,
-) {
+fn clamp_bow(bow_area: Res<BowArea>, mut bowq: Query<&mut Transform, With<Bow>>) {
     let mut bow = bowq.single_mut();
-    bow.translation = bow.translation.clamp(Vec3::new(bow_area.tl.x, bow_area.br.y, 0.), Vec3::new(bow_area.br.x, bow_area.tl.y, 1.));
+    bow.translation = bow.translation.clamp(
+        Vec3::new(bow_area.tl.x, bow_area.br.y, 0.),
+        Vec3::new(bow_area.br.x, bow_area.tl.y, 1.),
+    );
 }
 
 fn rotate_bow(mouse: Res<Mouse>, mut bow: Query<(&mut Transform, &Fixed), With<Bow>>) {
