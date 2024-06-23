@@ -1,15 +1,16 @@
 use bevy::{
     app::{App, FixedUpdate, Startup, Update},
     asset::{AssetServer, Assets},
+    ecs::reflect,
     hierarchy::BuildChildren,
     input::ButtonInput,
     math::{FloatExt, Quat, Rect, Vec2, Vec2Swizzles, Vec3, Vec3Swizzles},
     prelude::{
         default, Camera2dBundle, Changed, Circle, Commands, Component, Deref, DerefMut, Entity,
         Event, EventReader, EventWriter, Gizmos, IntoSystemConfigs, Line2d, MouseButton, Query,
-        Res, ResMut, Resource, With,
+        ReflectResource, Res, ResMut, Resource, With,
     },
-    reflect::Reflect,
+    reflect::{FromReflect, Reflect},
     render::{camera::Camera, color::Color, mesh::Mesh},
     sprite::{
         ColorMaterial, MaterialMesh2dBundle, SpriteBundle, SpriteSheetBundle, TextureAtlas,
@@ -44,7 +45,9 @@ fn main() {
         .insert_resource(Mouse(Vec2::ZERO))
         .insert_resource(Scoreboard { score: 0 })
         .insert_resource(G(18.))
+        .insert_resource(SpawnTimer(Timer::from_seconds(2., TimerMode::Repeating)))
         .add_plugins(ResourceInspectorPlugin::<G>::new())
+        .add_plugins(ResourceInspectorPlugin::<SpawnTimer>::new())
         .add_systems(Startup, (setup).chain())
         .add_systems(
             Update,
@@ -105,12 +108,12 @@ struct Area {
     tl: Vec2,
     br: Vec2,
     rect: Rect,
-    markers: [(Vec2, Vec2); 4],
+    walls: [(Vec2, Vec2); 4],
 }
 
 impl Area {
     fn new(tl: Vec2, br: Vec2) -> Self {
-        let markers = [
+        let walls = [
             (Vec2::new(tl.x, tl.y), Vec2::new(br.x, tl.y)),
             (Vec2::new(br.x, tl.y), Vec2::new(br.x, br.y)),
             (Vec2::new(br.x, br.y), Vec2::new(tl.x, br.y)),
@@ -121,7 +124,7 @@ impl Area {
             tl,
             br,
             rect: Rect::from_corners(tl, br),
-            markers,
+            walls,
         };
     }
 
@@ -145,13 +148,13 @@ impl Path {
 }
 
 trait PathFindingStrategy {
-    fn find(self, line1: (Vec2, Vec2), line2: (Vec2, Vec2)) -> Path;
+    fn find(self, line1: &(Vec2, Vec2), line2: &(Vec2, Vec2)) -> Path;
 }
 
 struct MinLengthPathFinder(f32);
 
 impl PathFindingStrategy for MinLengthPathFinder {
-    fn find(self, line1: (Vec2, Vec2), line2: (Vec2, Vec2)) -> Path {
+    fn find(self, line1: &(Vec2, Vec2), line2: &(Vec2, Vec2)) -> Path {
         let min = self.0;
         let mut start: Vec2;
         let mut end: Vec2;
@@ -169,6 +172,59 @@ impl PathFindingStrategy for MinLengthPathFinder {
 fn random_point_on_line(from: Vec2, to: Vec2) -> Vec2 {
     let t = rand::random::<f32>();
     return from.lerp(to, t);
+}
+
+fn pick<T>(slice: &Vec<T>) -> (&T, usize) {
+    let mut rng = rand::thread_rng();
+    let index = rng.gen_range(0..slice.len());
+    return (&slice[index], index);
+}
+
+#[derive(Resource, Deref, DerefMut, Reflect)]
+struct SpawnTimer(Timer);
+
+#[derive(Component)]
+struct Enemy;
+
+fn spaw_enemy(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut timer: ResMut<SpawnTimer>,
+    mut texture_atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+    asset_server: Res<AssetServer>,
+    enemy_area: Res<EnemyArea>
+) {
+    timer.tick(time.delta());
+    if timer.just_finished() {
+
+        let texture = asset_server.load("enemy/enemy.png");
+        let layout = TextureAtlasLayout::from_grid(Vec2::new(500. / 8., 50.), 8, 1, None, None);
+        let texture_atlas_layout = texture_atlas_layouts.add(layout);
+
+        let animation_indices = AnimationIndices { first: 0, last: 8 };
+
+        let mut walls = enemy_area.walls.to_vec();
+        let (start_wall, index) = pick(&walls);
+        // remove start wall from walls
+        let _ = walls.remove(index);
+        let (end_wall, _) = pick(&walls);
+
+        let path = MinLengthPathFinder(enemy_area.rect.width() / 2.)
+            .find(start_wall, end_wall);
+            
+
+        commands.spawn((
+            SpriteSheetBundle {
+                texture,
+                atlas: TextureAtlas {
+                    layout: texture_atlas_layout,
+                    index: animation_indices.first,
+                },
+                ..default()
+            },
+            Enemy,
+        ));
+    }
 }
 
 #[derive(Component)]
@@ -377,13 +433,13 @@ fn progress_bow(
 }
 
 fn draw_bow_area(bow_area: Res<BowArea>, mut gizmos: Gizmos) {
-    for marker in bow_area.markers {
+    for marker in bow_area.walls {
         gizmos.line_2d(marker.0, marker.1, Color::DARK_GRAY);
     }
 }
 
 fn draw_enemy_area(enemy_area: Res<EnemyArea>, mut gizmos: Gizmos) {
-    for marker in enemy_area.markers {
+    for marker in enemy_area.walls {
         gizmos.line_2d(marker.0, marker.1, Color::DARK_GRAY);
     }
 }
