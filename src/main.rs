@@ -18,7 +18,7 @@ use bevy::{
         ColorMaterial, MaterialMesh2dBundle, Sprite, SpriteBundle, SpriteSheetBundle, TextureAtlas,
         TextureAtlasLayout,
     },
-    text::{TextSection, TextStyle},
+    text::{Text, TextSection, TextStyle},
     time::{Time, Timer, TimerMode},
     transform::components::{GlobalTransform, Transform},
     ui::{node_bundles::TextBundle, PositionType, Style, Val},
@@ -45,7 +45,7 @@ fn main() {
         .add_plugins(ProgressBarPlugin)
         .add_plugins(WorldInspectorPlugin::new())
         .insert_resource(Mouse(Vec2::ZERO))
-        .insert_resource(Scoreboard { score: 0 })
+        .insert_resource(Scoreboard(0))
         .insert_resource(G(18.))
         .insert_resource(SpawnTimer(Timer::from_seconds(2., TimerMode::Repeating)))
         .add_plugins(ResourceInspectorPlugin::<G>::new())
@@ -69,7 +69,9 @@ fn main() {
                 update_mouse,
                 shoot_bow,
                 shoot_arrow,
+                check_arrow_collision,
                 move_bow_cursor,
+                update_scoreboard,
                 clamp_bow,
                 rotate_bow,
                 check_arrow_bounds,
@@ -92,10 +94,8 @@ struct G(f32);
 #[derive(Resource, Deref, DerefMut)]
 struct Mouse(Vec2);
 
-#[derive(Resource)]
-struct Scoreboard {
-    score: u32,
-}
+#[derive(Resource, Deref, DerefMut)]
+struct Scoreboard(u32);
 
 #[derive(Component)]
 struct ScoreboardUi;
@@ -418,7 +418,6 @@ fn setup(
     commands.insert_resource(enemy_area);
     commands.insert_resource(path_finder);
 
-
     let bar = ProgressBar::new(vec![(200, Color::BLUE)]);
     let style = Style {
         position_type: PositionType::Absolute,
@@ -680,6 +679,33 @@ fn check_arrow_bounds(
             despawns.send(DespawnEvent(entity));
         }
     }
+}
+
+fn check_arrow_collision(
+    mut score: ResMut<Scoreboard>,
+    arrows: Query<(Entity, &Transform), With<Arrow>>,
+    enemies: Query<(Entity, &Transform, &Sprite), With<Enemy>>,
+    mut despawns: EventWriter<DespawnEvent>,
+) {
+    for (arrow_entity, arrow_tr) in &arrows {
+        for (enemy_entity, enemy_tr, enemy_size) in &enemies {
+            if (arrow_tr.translation.xy() - enemy_tr.translation.xy()).length()
+                < enemy_size.custom_size.unwrap().x
+            {
+                despawns.send(DespawnEvent(arrow_entity));
+                despawns.send(DespawnEvent(enemy_entity));
+                **score += 1
+            }
+        }
+    }
+}
+
+fn update_scoreboard(
+    score: Res<Scoreboard>,
+    mut query: Query<&mut Text, With<ScoreboardUi>>,
+) {
+    let mut text = query.single_mut();
+    text.sections[1].value = (**score).to_string();
 }
 
 fn rotate_arrows(mut arrows: Query<(&mut Transform, &Vel), With<Arrow>>) {
