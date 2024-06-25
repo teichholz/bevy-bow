@@ -11,9 +11,11 @@ use bevy::{
         ReflectResource, Res, ResMut, Resource, With,
     },
     reflect::{FromReflect, Reflect},
-    render::{camera::Camera, color::Color, mesh::Mesh},
+    render::{
+        camera::Camera, color::Color, mesh::Mesh, render_resource::encase::rts_array::Length,
+    },
     sprite::{
-        ColorMaterial, MaterialMesh2dBundle, SpriteBundle, SpriteSheetBundle, TextureAtlas,
+        ColorMaterial, MaterialMesh2dBundle, Sprite, SpriteBundle, SpriteSheetBundle, TextureAtlas,
         TextureAtlasLayout,
     },
     text::{TextSection, TextStyle},
@@ -52,11 +54,12 @@ fn main() {
         .add_systems(
             Update,
             (
-                draw_bow,
+                animate_bow,
                 draw_bow_area,
                 draw_enemy_area,
                 move_arrows,
                 rotate_arrows,
+                move_enemy,
             )
                 .chain(),
         )
@@ -71,6 +74,8 @@ fn main() {
                 rotate_bow,
                 check_arrow_bounds,
                 progress_bow,
+                spawn_enemy,
+                animate_enemy,
             )
                 .chain(),
         )
@@ -104,20 +109,31 @@ struct BowArea(Area);
 #[derive(Resource, Deref, DerefMut)]
 struct EnemyArea(Area);
 
+#[derive(Clone, PartialEq)]
+enum Side {
+    North,
+    East,
+    South,
+    West,
+}
+
+#[derive(Component, Deref)]
+struct EndsAt(Side);
+
 struct Area {
     tl: Vec2,
     br: Vec2,
     rect: Rect,
-    walls: [(Vec2, Vec2); 4],
+    walls: [(Side, Vec2, Vec2); 4],
 }
 
 impl Area {
     fn new(tl: Vec2, br: Vec2) -> Self {
         let walls = [
-            (Vec2::new(tl.x, tl.y), Vec2::new(br.x, tl.y)),
-            (Vec2::new(br.x, tl.y), Vec2::new(br.x, br.y)),
-            (Vec2::new(br.x, br.y), Vec2::new(tl.x, br.y)),
-            (Vec2::new(tl.x, br.y), Vec2::new(tl.x, tl.y)),
+            (Side::East, Vec2::new(tl.x, tl.y), Vec2::new(br.x, tl.y)),
+            (Side::South, Vec2::new(br.x, tl.y), Vec2::new(br.x, br.y)),
+            (Side::West, Vec2::new(br.x, br.y), Vec2::new(tl.x, br.y)),
+            (Side::North, Vec2::new(tl.x, br.y), Vec2::new(tl.x, tl.y)),
         ];
 
         return Area {
@@ -148,19 +164,35 @@ impl Path {
 }
 
 trait PathFindingStrategy {
-    fn find(self, line1: &(Vec2, Vec2), line2: &(Vec2, Vec2)) -> Path;
+    fn find(self, line1: &(Side, Vec2, Vec2), line2: &(Side, Vec2, Vec2)) -> Path;
+    fn find_from_start(self, line1: &Vec2, line2: &(Side, Vec2, Vec2)) -> Path;
 }
 
+#[derive(Resource, Copy, Clone)]
 struct MinLengthPathFinder(f32);
 
 impl PathFindingStrategy for MinLengthPathFinder {
-    fn find(self, line1: &(Vec2, Vec2), line2: &(Vec2, Vec2)) -> Path {
+    fn find(self, line1: &(Side, Vec2, Vec2), line2: &(Side, Vec2, Vec2)) -> Path {
         let min = self.0;
         let mut start: Vec2;
         let mut end: Vec2;
         loop {
-            start = random_point_on_line(line1.0, line1.1);
-            end = random_point_on_line(line2.0, line2.1);
+            start = random_point_on_line(line1.1, line1.2);
+            end = random_point_on_line(line2.1, line2.2);
+            if (end - start).length() >= min {
+                break;
+            }
+        }
+        return Path { start, end };
+    }
+
+    fn find_from_start(self, line1: &Vec2, line2: &(Side, Vec2, Vec2)) -> Path {
+        let min = self.0;
+        let mut start: Vec2;
+        let mut end: Vec2;
+        loop {
+            start = *line1;
+            end = random_point_on_line(line2.1, line2.2);
             if (end - start).length() >= min {
                 break;
             }
@@ -174,10 +206,10 @@ fn random_point_on_line(from: Vec2, to: Vec2) -> Vec2 {
     return from.lerp(to, t);
 }
 
-fn pick<T>(slice: &Vec<T>) -> (&T, usize) {
+fn pick<T: Clone>(amount: usize, slice: &Vec<T>) -> Vec<usize> {
     let mut rng = rand::thread_rng();
-    let index = rng.gen_range(0..slice.len());
-    return (&slice[index], index);
+
+    rand::seq::index::sample(&mut rng, slice.length(), amount).into_vec()
 }
 
 #[derive(Resource, Deref, DerefMut, Reflect)]
@@ -186,32 +218,30 @@ struct SpawnTimer(Timer);
 #[derive(Component)]
 struct Enemy;
 
-fn spaw_enemy(
+fn spawn_enemy(
     mut commands: Commands,
     time: Res<Time>,
+    path_finder: Res<MinLengthPathFinder>,
     mut timer: ResMut<SpawnTimer>,
     mut texture_atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     asset_server: Res<AssetServer>,
-    enemy_area: Res<EnemyArea>
+    enemy_area: Res<EnemyArea>,
 ) {
     timer.tick(time.delta());
     if timer.just_finished() {
-
         let texture = asset_server.load("enemy/enemy.png");
         let layout = TextureAtlasLayout::from_grid(Vec2::new(500. / 8., 50.), 8, 1, None, None);
         let texture_atlas_layout = texture_atlas_layouts.add(layout);
 
-        let animation_indices = AnimationIndices { first: 0, last: 8 };
+        let animation_indices = AnimationIndices { first: 0, last: 7 };
 
-        let mut walls = enemy_area.walls.to_vec();
-        let (start_wall, index) = pick(&walls);
-        // remove start wall from walls
-        let _ = walls.remove(index);
-        let (end_wall, _) = pick(&walls);
+        let walls = enemy_area.walls.to_vec();
+        let is = &pick(2, &walls)[..];
+        let start_wall = &walls[is[0]];
+        let end_wall = &walls[is[1]];
 
-        let path = MinLengthPathFinder(enemy_area.rect.width() / 2.)
-            .find(start_wall, end_wall);
-            
+        let path = path_finder.find(start_wall, end_wall);
+        let size = thread_rng().gen_range((500. / 8.)..100.);
 
         commands.spawn((
             SpriteSheetBundle {
@@ -220,10 +250,75 @@ fn spaw_enemy(
                     layout: texture_atlas_layout,
                     index: animation_indices.first,
                 },
+                transform: Transform {
+                    translation: path.start.extend(0.),
+                    ..default()
+                },
+                sprite: Sprite {
+                    custom_size: Some(Vec2::new(size, size)),
+                    ..default()
+                },
                 ..default()
             },
+            Speed(200.),
+            AnimationTimer(Timer::from_seconds(0.2, TimerMode::Repeating)),
+            animation_indices,
+            path,
+            EndsAt(end_wall.0.clone()),
             Enemy,
         ));
+    }
+}
+
+fn animate_enemy(
+    time: Res<Time>,
+    mut query: Query<
+        (
+            &AnimationIndices,
+            &mut Sprite,
+            &mut AnimationTimer,
+            &mut TextureAtlas,
+            &Path,
+        ),
+        With<Enemy>,
+    >,
+) {
+    for (indices, mut sprite, mut timer, mut atlas, path) in &mut query {
+        // sprite looks to the left by default
+        sprite.flip_x = (path.end - path.start).x > 0.;
+
+        timer.tick(time.delta());
+        if timer.just_finished() {
+            if atlas.index < indices.last {
+                atlas.index += 1;
+            } else {
+                atlas.index = indices.first;
+            }
+        }
+    }
+}
+
+fn move_enemy(
+    time: Res<Time>,
+    path_finder: Res<MinLengthPathFinder>,
+    enemy_area: Res<EnemyArea>,
+    mut query: Query<(&Speed, &mut Transform, &mut Path, &EndsAt), With<Enemy>>,
+) {
+    for (speed, mut transform, mut path, EndsAt(side)) in &mut query {
+        let vel = (path.end - path.start).normalize() * **speed * time.delta_seconds();
+        transform.translation += vel.extend(0.);
+        let px_threshold = 5.;
+        if (transform.translation - path.end.extend(0.)).length() < px_threshold {
+            let start = path.end;
+            let walls: Vec<&(Side, Vec2, Vec2)> = enemy_area
+                .walls
+                .iter()
+                .filter(|wall| wall.0 != *side)
+                .collect();
+            let index = pick(1, &walls)[..][0];
+            let end_wall = walls[..][index];
+            *path = path_finder.find_from_start(&start, end_wall);
+        }
     }
 }
 
@@ -251,6 +346,9 @@ struct DespawnEvent(Entity);
 
 #[derive(Component, Deref, DerefMut)]
 struct Vel(Vec2);
+
+#[derive(Component, Deref, DerefMut)]
+struct Speed(f32);
 
 #[derive(Component, Deref, DerefMut)]
 struct Acc(Vec2);
@@ -309,13 +407,17 @@ fn setup(
         Vec2::new(win.width() / -4., win.height() / -2.),
     )));
 
-    commands.insert_resource(EnemyArea(
+    let enemy_area = EnemyArea(
         Area::new(
             Vec2::new(0., win.height() / 2.),
             Vec2::new(win.width() / 2., win.height() / -2.),
         )
         .shrink(0.1),
-    ));
+    );
+    let path_finder = MinLengthPathFinder(enemy_area.rect.width() / 2.);
+    commands.insert_resource(enemy_area);
+    commands.insert_resource(path_finder);
+
 
     let bar = ProgressBar::new(vec![(200, Color::BLUE)]);
     let style = Style {
@@ -376,7 +478,7 @@ fn on_window_change(
     }
 }
 
-fn draw_bow(
+fn animate_bow(
     time: Res<Time>,
     mut query: Query<
         (
@@ -433,14 +535,14 @@ fn progress_bow(
 }
 
 fn draw_bow_area(bow_area: Res<BowArea>, mut gizmos: Gizmos) {
-    for marker in bow_area.walls {
-        gizmos.line_2d(marker.0, marker.1, Color::DARK_GRAY);
+    for marker in &bow_area.walls {
+        gizmos.line_2d(marker.1, marker.2, Color::DARK_GRAY);
     }
 }
 
 fn draw_enemy_area(enemy_area: Res<EnemyArea>, mut gizmos: Gizmos) {
-    for marker in enemy_area.walls {
-        gizmos.line_2d(marker.0, marker.1, Color::DARK_GRAY);
+    for marker in &enemy_area.walls {
+        gizmos.line_2d(marker.1, marker.2, Color::DARK_GRAY);
     }
 }
 
