@@ -109,7 +109,7 @@ struct BowArea(Area);
 #[derive(Resource, Deref, DerefMut)]
 struct EnemyArea(Area);
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Side {
     North,
     East,
